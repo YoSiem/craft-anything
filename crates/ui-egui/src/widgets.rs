@@ -80,9 +80,15 @@ pub fn named(resp: Response, name: &str) -> Response {
 /// A suggestion: a sentence in a hairline box that fills in a field when clicked. Wraps when
 /// it's wider than the space it has; fills the width in a justified layout (a tidy list).
 pub fn suggestion(ui: &mut Ui, text: &str) -> Response {
+    suggestion_as_given(ui, &tr(text))
+}
+
+/// [`suggestion`] for text that isn't ours to translate (a builder's or a person's words): shown
+/// exactly as given.
+pub fn suggestion_as_given(ui: &mut Ui, text: &str) -> Response {
     let t = Tokens::get(ui.ctx());
     let max_w = ui.available_width().max(60.0);
-    let g = ui.painter().layout(tr(text), egui::FontId::proportional(theme::SMALL), t.text, max_w - 26.0);
+    let g = ui.painter().layout(text.to_string(), egui::FontId::proportional(theme::SMALL), t.text, max_w - 26.0);
     let w = if ui.layout().horizontal_justify() { max_w } else { (g.size().x + 26.0).min(max_w) };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, (g.size().y + 14.0).max(32.0)), Sense::click());
     let h = hover_t(ui, &resp);
@@ -96,7 +102,7 @@ pub fn suggestion(ui: &mut Ui, text: &str) -> Response {
     let pos = egui::pos2(rect.left() + 13.0, rect.center().y - g.size().y / 2.0);
     ui.painter().galley_with_override_text_color(pos, g, theme::mix(t.text_dim, t.text, h));
     focus_ring(ui, &resp, rect);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr(text)));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -218,8 +224,17 @@ const BUTTON_ICON_W: f32 = 22.0;
 
 /// A borderless text button in the accent colour.
 pub fn link(ui: &mut Ui, label: &str) -> Response {
+    link_text(ui, RichText::new(tr(label)))
+}
+
+/// [`link`] at the small text size, for a link among small text.
+pub fn small_link(ui: &mut Ui, label: &str) -> Response {
+    link_text(ui, RichText::new(tr(label)).size(theme::SMALL))
+}
+
+fn link_text(ui: &mut Ui, text: RichText) -> Response {
     let t = Tokens::get(ui.ctx());
-    let r = ui.add(egui::Label::new(RichText::new(tr(label)).color(t.accent_ink)).sense(Sense::click()));
+    let r = ui.add(egui::Label::new(text.color(t.accent_ink)).sense(Sense::click()));
     let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
     if r.hovered() {
         let y = r.rect.bottom();
@@ -384,6 +399,59 @@ pub fn animate(ui: &Ui, every: std::time::Duration) {
 /// One frame of an animation at the usual pace.
 pub const FRAME: std::time::Duration = std::time::Duration::from_millis(66);
 
+/// A spinning arc for "working", drawn like egui's own `Spinner` but asking for its next frame at
+/// [`animate`]'s pace. egui's asks to be drawn again at once, every frame, for as long as it's on
+/// screen: a build or a page capture can run for an hour, and redrawing the whole window at the
+/// display's rate for it kept a CPU core (or, drawing in software, all of them) busy (#579).
+#[must_use = "put it in a ui with `ui.add(widget);`"]
+#[derive(Default)]
+pub struct Spinner {
+    size: Option<f32>,
+    color: Option<Color32>,
+}
+
+impl Spinner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn size(mut self, size: f32) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    pub fn color(mut self, color: Color32) -> Self {
+        self.color = Some(color);
+        self
+    }
+}
+
+impl egui::Widget for Spinner {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = self.size.unwrap_or_else(|| ui.style().spacing.interact_size.y);
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+        if ui.is_rect_visible(rect) {
+            let color = self.color.unwrap_or_else(|| ui.visuals().strong_text_color());
+            let radius = (rect.height().min(rect.width()) / 2.0) - 2.0;
+            let n_points = (radius.round() as u32).clamp(8, 128);
+            let time = ui.input(|i| i.time);
+            let start = time * std::f64::consts::TAU;
+            let end = start + 240f64.to_radians() * time.sin();
+            let points: Vec<egui::Pos2> = (0..n_points)
+                .map(|i| {
+                    let angle = start + (end - start) * (i as f64 / n_points as f64);
+                    let (sin, cos) = angle.sin_cos();
+                    rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(points, Stroke::new(3.0, color)));
+            animate(ui, FRAME);
+        }
+        response
+    }
+}
+
 /// A spinner-ish dot row for "thinking".
 pub fn thinking(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
@@ -482,6 +550,50 @@ pub fn open_log_button(ui: &mut Ui, path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// #579: egui's `Spinner` asks to be redrawn at once, every frame, for as long as it shows;
+    /// ours waits for the animation's own pace, so an hour-long build isn't drawn at the display's
+    /// rate. Both are drawn here for comparison.
+    #[test]
+    fn a_spinner_on_screen_does_not_ask_for_a_frame_at_once() {
+        let wait_after = |add: &dyn Fn(&mut Ui)| {
+            let ctx = egui::Context::default();
+            let mut raw = egui::RawInput::default();
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().focused = Some(true);
+            // The first frames always ask for another (layout settles); look at a settled one.
+            let mut out = egui::FullOutput::default();
+            for _ in 0..4 {
+                out = ctx.run_ui(raw.clone(), |ui| add(ui));
+                out.textures_delta.clear();
+            }
+            out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or_default()
+        };
+        let egui_spinner = wait_after(&|ui| {
+            ui.add(egui::Spinner::new());
+        });
+        assert!(egui_spinner < Duration::from_millis(10), "egui's own asks for the next frame at once: {egui_spinner:?}");
+        let ours = wait_after(&|ui| {
+            ui.add(Spinner::new().size(16.0));
+        });
+        assert!(ours >= Duration::from_millis(30), "ours waits for the animation's pace: {ours:?}");
+    }
+
+    /// #579: every screen uses our spinner; egui's own would bring the redraw-every-frame back.
+    #[test]
+    fn no_screen_uses_eguis_own_spinner() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut used = Vec::new();
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs") && path.file_name().is_some_and(|n| n != "widgets.rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if text.lines().any(|l| !l.trim_start().starts_with("//") && l.contains("egui::Spinner")) {
+                    used.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        assert!(used.is_empty(), "use `widgets::Spinner`, which doesn't ask for a frame every frame: {used:?}");
+    }
 
     #[test]
     fn the_wait_note_says_when_nothing_is_happening() {

@@ -9,7 +9,7 @@ Rules:
 - Their request comes first. When it says how to build (a language, framework, engine, library or platform), build with exactly that, even where these instructions name something else: the stack given here is only the default for what the request leaves open. Don't switch away from what they asked for to get past a failing build or check; fix the build instead.
 - Change files only inside app/. Everything else in the workspace is read-only evidence.
 - Rebuild the layout, styling and behaviour yourself from the evidence. Don't copy logos, photos, brand names or long passages of text unless the person confirms they own the original or have permission (ask once with core_person_ask if it matters); otherwise use neutral placeholders: simple shapes or gradients for images, short sample copy for text.
-- Use the core_person_ask tool (craft-anything MCP server) only for choices that really change the result. Give 2-4 short choices. Never ask about technical details you can decide yourself.
+- Use the core_person_ask tool (craft-anything MCP server) only for choices that really change the result. Give about three short choices, best first. Never ask about technical details you can decide yourself.
 - Build what the person asked for. If part of it won't fit this version (for example online co-op, a whole game mode or another platform), ask with core_person_ask before leaving it out, with the smaller version as one of the choices; never drop it silently.
 - Never start dev servers, watchers or anything that doesn't exit (npm run dev, npm start, vite, cargo watch). Craft Anything serves and checks the build itself.
 - Finish with 3-5 plain sentences for the person: what you built, what differs from the original or is still unknown, and one idea for what to ask next. No code and no file paths in that summary.";
@@ -26,7 +26,7 @@ pub(super) fn steps(deep: bool) -> String {
     };
     format!(
         "How to work: you lead the investigation and the craft-anything tools answer your questions with evidence.
-1) Study the evidence, overview first (the README and summaries before the details). Where it leaves a gap that matters to the result, ask a focused follow-up with the craft-anything tools instead of guessing: {follow_up} Don't repeat a call that already answered. Record each question the evidence doesn't answer yet with core_unknown_add (the question, what would settle it as probes, and how much it matters as severity), and when a later look answers it, close it with core_unknown_edit (status resolved, the resolution and the evidence ids that settle it); until then say in it what you did instead (an estimate, a placeholder or a question for the person). Missing evidence is never proof, so mark what you estimated.
+1) Study the evidence, overview first (the README and summaries before the details). Where it leaves a gap that matters to the result, ask a focused follow-up with the craft-anything tools instead of guessing: {follow_up} Don't repeat a call that already answered. Record each question the evidence doesn't answer yet with core_unknown_add (the question, three short suggested answers the person can pick from as suggested_answers, best first, what would settle it as probes, and how much it matters as severity), and when a later look answers it, close it with core_unknown_edit (status resolved, the resolution and the evidence ids that settle it); until then say in it what you did instead (an estimate, a placeholder or a question for the person). When the person answers one of them (their message names its id, unk_…), follow their answer (if they let you decide, choose and say what you chose) and close it with core_unknown_edit: status resolved, the answer as the resolution and resolved_by person. Missing evidence is never proof, so mark what you estimated.
 2) Make a short checklist with TodoWrite: 3-7 steps in plain words the person can follow (no file names or jargon), each with a short activeForm such as \"Drawing the map\"; the person watches it live, so keep it updated as you go.
 3) Build it in app/ and fix errors until the build succeeds.
 4) Test it against the original with rebuild_check: it runs the same checks Craft Anything runs after your turn and lists what differs and what couldn't be compared. Fix those, build and check again until it says it would pass.
@@ -40,10 +40,16 @@ pub(super) fn stack_steps(stack: &str, editor: Option<&Path>) -> String {
 }
 
 /// The stack's steps, then those of each library the request asks for that works with it
-/// ("use nextjs and shadcn" adds shadcn/ui's).
-fn stack_and_library_steps(request: &str, stack: &str, editor: Option<&Path>) -> String {
-    let mut s = stack_steps(stack, editor);
-    for l in stacks::libraries_for(request, stack) {
+/// ("use nextjs and shadcn" adds shadcn/ui's). A stack's steps make a new project (Unity's say to
+/// write a build script into it), so a person's own project keeps to what it has.
+fn stack_and_library_steps(m: &craft_anything_engine::workspace::Manifest, editor: Option<&Path>) -> String {
+    let mut s = if m.own_project() {
+        let editor = editor.map(|e| format!(" The editor is {}.", e.display())).unwrap_or_default();
+        format!("keep to what the project already uses.{editor}")
+    } else {
+        stack_steps(&m.stack, editor)
+    };
+    for l in stacks::libraries_for(&m.request, &m.stack) {
         s.push(' ');
         s.push_str(&l.steps);
     }
@@ -81,14 +87,15 @@ pub(super) fn brief(kind: &dyn TargetKind, cx: &BriefCx, extra: Option<&str>) ->
         }
         TargetRef::None => "There is no target to study.",
     };
+    let goal = if m.own_project() { "what their request asks of the project in this folder" } else { kind.goal() };
     let mut s = format!(
         "You are the builder inside Craft Anything, rebuilding software for a person who doesn't code.\n\n\
          Their request: \"{}\"\nTarget: {target}\nYour working folder is the project workspace ({}).\n\n{capture}\n\n\
          What to build: {}.\n\nHow to build it, unless their request says otherwise: {}\n\n{}\n\n{RULES}",
         m.request,
         ws.root.display(),
-        kind.goal(),
-        stack_and_library_steps(&m.request, &m.stack, cx.editor),
+        goal,
+        stack_and_library_steps(m, cx.editor),
         steps(cx.deep),
     );
     for section in kind.brief_sections(cx) {
@@ -115,8 +122,9 @@ pub(super) fn start_files_note(m: &craft_anything_engine::workspace::Manifest) -
     let names = m.start_files.join(", ");
     let own = craft_anything_engine::workspace::OWN_NAMES.join(", ");
     Some(if m.app_in_root {
+        let checked = if m.own_project() { " It's checked by running its own build and tests: add nothing to it for Craft Anything's sake." } else { "" };
         format!(
-            "This project's app is the person's own folder, the project workspace itself, and it already has their files ({names}). Wherever these instructions say app/, use the workspace folder itself (./): work on their files in place, keep what works and change only what the request needs; never start over, delete or replace their work, and don't create an app/ folder. Craft Anything keeps its own records beside their files ({own}): leave those alone."
+            "This project's app is the person's own folder, the project workspace itself, and it already has their files ({names}). Wherever these instructions say app/, use the workspace folder itself (./): work on their files in place, keep what works and change only what the request needs; never start over, delete or replace their work, and don't create an app/ folder. Craft Anything keeps its own records beside their files ({own}): leave those alone.{checked}"
         )
     } else {
         format!(
@@ -259,7 +267,7 @@ pub(super) fn pictures_note(ws: &Workspace, kind: &dyn TargetKind) -> Option<Str
         "The person added {} picture(s) of the original: {names}. They show the result they expect. Open every one with the Read tool before you plan, and match what they show: the camera or view, the on-screen layout (menus, HUD, panels) and where each part sits, the colours and lighting, the look of surfaces and characters, and the proportions and scale. Make your own artwork in that style; don't trace or copy logos, characters or other artwork from them.",
         pics.len()
     );
-    if kind.self_screenshots() {
+    if kind.self_screenshots() && !ws.manifest.own_project() {
         s.push_str(" After each build, run the program with --screenshot to a file inside app/ (for example app/shots/now.png), open that picture with Read, compare it with each picture of the original, and fix the biggest differences first.");
     }
     Some(s)

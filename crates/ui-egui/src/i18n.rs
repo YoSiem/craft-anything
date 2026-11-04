@@ -20,10 +20,14 @@ pub struct LangInfo {
 
 pub static LANGUAGES: &[LangInfo] = &[
     LangInfo { code: "en", name: "English", source: "" },
+    LangInfo { code: "de", name: "Deutsch", source: include_str!("i18n/de.tsv") },
     LangInfo { code: "fr", name: "Français", source: include_str!("fr.tsv") },
     LangInfo { code: "ja", name: "日本語", source: include_str!("ja.tsv") },
     LangInfo { code: "zh-hans", name: "简体中文", source: include_str!("i18n/zh-hans.tsv") },
     LangInfo { code: "zh-hant", name: "繁體中文", source: include_str!("i18n/zh-hant.tsv") },
+    LangInfo { code: "ru", name: "Русский", source: include_str!("i18n/ru.tsv") },
+    LangInfo { code: "ko", name: "한국어", source: include_str!("i18n/ko.tsv") },
+    LangInfo { code: "cs", name: "Čeština", source: include_str!("i18n/cs.tsv") },
 ];
 
 /// Match a locale to a registered UI language. An explicit script wins over the region.
@@ -106,10 +110,31 @@ pub fn tr(s: &str) -> String {
 
 /// Translate, then fill `{name}` placeholders.
 pub fn trf(s: &str, args: &[(&str, &str)]) -> String {
-    let mut out = tr(s);
-    for (k, v) in args {
-        out = out.replace(&format!("{{{k}}}"), v);
+    fill(&tr(s), args)
+}
+
+/// Fill `{name}` placeholders in one pass over `template`, so a value that itself holds a
+/// `{name}` (a question someone typed) is kept as it is, never filled in turn. Braces that name
+/// no argument stay as written.
+fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some((before, from)) = rest.find('{').and_then(|i| rest.split_at_checked(i)) {
+        out.push_str(before);
+        // `from` starts at the `{`: a name up to the next `}`, if it's one of the arguments.
+        let named = from.find('}').and_then(|end| from.get(1..end)).and_then(|name| args.iter().find(|(k, _)| *k == name));
+        match named {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = from.get(k.len().saturating_add(2)..).unwrap_or_default();
+            }
+            None => {
+                out.push('{');
+                rest = from.get(1..).unwrap_or_default();
+            }
+        }
     }
+    out.push_str(rest);
     out
 }
 
@@ -123,6 +148,10 @@ mod tests {
         assert_eq!(m.get("Hello").map(String::as_str), Some("Hola"));
         assert!(!m.contains_key("Empty"));
         assert_eq!(trf("Open {name}", &[("name", "a.exe")]), "Open a.exe");
+        // One pass: a value holding a placeholder is kept as it is; unknown names stay.
+        assert_eq!(fill("\"{q}\": {a}", &[("q", "Use {a}?"), ("a", "yes")]), "\"Use {a}?\": yes");
+        assert_eq!(fill("{n} of {n}, {:.1} {x} {", &[("n", "2")]), "2 of 2, {:.1} {x} {");
+        assert_eq!(fill("中{q}文", &[("q", "{")]), "中{文");
         assert_eq!(tr("Untranslated"), "Untranslated");
     }
 
@@ -137,22 +166,25 @@ mod tests {
         assert_eq!(language_from_tag("en-US"), Some("en"));
         assert_eq!(language_from_tag("ja-JP"), Some("ja"));
         assert_eq!(language_from_tag("fr-CA"), Some("fr"));
-        assert_eq!(language_from_tag("de-DE"), None);
-        assert_eq!(preferred_language(["de-DE", "zh-HK", "en-US"]), "zh-hant");
+        assert_eq!(language_from_tag("de-DE"), Some("de"));
+        assert_eq!(language_from_tag("de_AT.UTF-8"), Some("de"));
+        assert_eq!(language_from_tag("es-ES"), None);
+        assert_eq!(preferred_language(["es-ES", "zh-HK", "en-US"]), "zh-hant");
+        assert_eq!(preferred_language(["de-DE", "zh-HK"]), "de");
         assert_eq!(preferred_language(["en-US", "zh-CN"]), "en");
-        assert_eq!(preferred_language(["de-DE"]), "en");
+        assert_eq!(preferred_language(["es-ES"]), "en");
         assert_eq!(preferred_language(std::iter::empty::<&str>()), "en");
     }
 
     #[test]
-    fn chinese_catalogs_are_valid_and_have_matching_keys() {
+    fn catalogs_are_valid_and_have_matching_keys() {
         fn placeholders(s: &str) -> Vec<&str> {
             let mut out: Vec<_> = s.split('{').skip(1).filter_map(|s| s.split_once('}').map(|(p, _)| p)).collect();
             out.sort_unstable();
             out
         }
         let mut catalogs = Vec::new();
-        for lang in LANGUAGES.iter().filter(|l| matches!(l.code, "zh-hans" | "zh-hant")) {
+        for lang in LANGUAGES.iter().filter(|l| matches!(l.code, "zh-hans" | "zh-hant" | "ru" | "ko" | "cs" | "de")) {
             let mut keys = std::collections::BTreeSet::new();
             for (i, line) in lang.source.lines().enumerate() {
                 if line.trim().is_empty() || line.starts_with('#') {
@@ -170,8 +202,10 @@ mod tests {
             assert!(keys.len() > 500, "{}: incomplete catalog", lang.code);
             catalogs.push(keys);
         }
-        assert_eq!(catalogs.len(), 2);
-        assert_eq!(catalogs.first(), catalogs.last());
+        assert!(catalogs.len() >= 2);
+        for c in catalogs.iter().skip(1) {
+            assert_eq!(catalogs.first(), Some(c));
+        }
     }
 
     /// Every translation keeps its key's `{placeholders}`, or `trf` would leave them unfilled.

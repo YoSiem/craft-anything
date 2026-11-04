@@ -42,7 +42,7 @@ impl<'ast> Visit<'ast> for Lookups {
             let positions: &[usize] = match (owner.as_str(), name.as_str()) {
                 (_, "tr" | "trf") => &[0],
                 ("widgets", "primary" | "link" | "suggestion" | "caption" | "pill" | "working" | "working_since" | "segmented" | "segmented_sized") => &[1],
-                ("widgets", "named") => &[1],
+                ("widgets", "named" | "small_link") => &[1],
                 ("widgets", "primary_icon" | "primary_sized" | "secondary") => &[2],
                 ("widgets", "toggle") => &[2],
                 ("widgets", "choice_tile" | "big_card") => &[3, 4],
@@ -88,7 +88,7 @@ pub fn check(root: &Path) -> bool {
         lookups.0.0.insert(spec.toolset.title().to_string());
     }
     let mut ok = true;
-    for code in ["zh-hans", "zh-hant"] {
+    for code in ["zh-hans", "zh-hant", "ru", "ko", "de"] {
         let path = source.join("i18n").join(format!("{code}.tsv"));
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!("i18n: can't read {}", path.display());
