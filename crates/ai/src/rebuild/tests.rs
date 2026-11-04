@@ -1,6 +1,12 @@
 use super::check::build_check;
 use super::*;
 
+#[path = "note_progress_tests.rs"]
+mod note_progress;
+
+#[path = "stall_tests.rs"]
+mod stall;
+
 // Helpers that take a built-in kind's id, so each test reads as one line.
 fn kind(id: &str) -> Arc<dyn TargetKind> {
     KindRegistry::built_in().get(id).unwrap()
@@ -54,6 +60,16 @@ fn stack_choice() {
     assert_eq!(choose("Clone Untitled Project. Match the original as closely as possible 1:1.", &folder).0, "app");
     assert_eq!(kind_of("Clone Untitled Project. Match the original as closely as possible 1:1.", &folder, "Unreal Engine"), "game");
     assert_eq!(kind_of("Copy this tool", &folder, "Rust + egui (eframe)"), "app", "the app stack stays an app");
+}
+
+#[test]
+fn german_requests_keep_their_project_kind() {
+    for request in ["Ein einfaches Snake-Spiel", "Dasselbe Spiel mit einer Bestenliste"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Eine Website für meine Bäckerei", "Diese Webseite nachbauen"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
 }
 
 #[test]
@@ -294,16 +310,17 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     assert!(w.added(&mut ws).is_none(), "nothing added, nothing to say");
-    let note = |id, text: &str| Note { id, text: format!("{text} (pictures: a.png)"), shown: text.into() };
+    let note = |id, text: &str| Note { id, text: format!("{text} (pictures: a.png)"), shown: text.into(), pictures: Vec::new() };
     notes.lock().unwrap().extend([note(1, "Make it faster"), note(2, "A blue sky")]);
     let p = w.added(&mut ws).unwrap();
     assert!(p.contains("- Make it faster (pictures: a.png)\n- A blue sky"), "{p}");
     assert!(notes.lock().unwrap().is_empty(), "each note goes in once");
     // The notes join the feed as they're read, before the step that reads them.
     let events: Vec<RunEvent> = rx.try_iter().collect();
-    let shown: Vec<_> = events.iter().filter_map(|e| if let RunEvent::Note(s) = e { Some(s.as_str()) } else { None }).collect();
+    let shown: Vec<_> = events.iter().filter_map(|e| if let RunEvent::Note { shown, .. } = e { Some(shown.as_str()) } else { None }).collect();
     assert_eq!(shown, ["Make it faster", "A blue sky"]);
     assert!(matches!(events.last(), Some(RunEvent::Step { text, .. }) if text == "Reading what you added…"));
 }
@@ -323,35 +340,435 @@ fn pictures_of_the_original_reach_the_builder() {
     assert!(pictures_reminder(&ws).contains("1 picture(s)"));
 }
 
-#[test]
-fn a_cut_off_turn_is_resumed_unless_the_person_must_act() {
-    for resumable in ["Claude Code took longer than 86400 s and was stopped.", "API Error: 529 overloaded", "connection reset by peer"] {
-        assert!(worth_retrying(resumable), "{resumable}");
-    }
-    for needs_you in [
-        "Not logged in. Please run /login",
-        "Your credit balance is too low",
-        "Claude Code is not installed",
-        "Invalid API key · Please run /login",
-        "Claude Code 2.1.81 does not support this model",
-    ] {
-        assert!(!worth_retrying(needs_you), "{needs_you}");
-    }
-    assert_eq!(RunOptions::default().max_rounds, 6, "room to keep fixing until it works");
-}
+mod typed_retries {
+    use super::*;
+    use crate::{FailureKind, TurnFailure};
+    use std::collections::VecDeque;
 
-/// #142: a rate-limited service's own wait is followed (rounded up, capped), not a fixed one.
-#[test]
-fn a_services_requested_wait_is_read() {
-    assert_eq!(retry_after("OpenCode stopped with exit code 1: Please retry in 19.052906498s."), Some(20));
-    assert_eq!(retry_after("Rate limit reached. Retry after 2 minutes"), Some(120));
-    assert_eq!(retry_after("try again in 500ms"), Some(1));
-    assert_eq!(retry_after("Please try again in 3h"), Some(MAX_RETRY_WAIT));
-    assert_eq!(retry_after("Retry in 45 seconds"), Some(45));
-    for no_wait in ["API Error: 529 overloaded", "please retry in a moment", "retry in ."] {
-        assert_eq!(retry_after(no_wait), None, "{no_wait}");
+    struct FailingConversation {
+        failures: VecDeque<Option<TurnFailure>>,
+        failure: Option<TurnFailure>,
+        queued: Vec<AgentEvent>,
+        sent: Vec<String>,
+        session: Option<String>,
+        message: &'static str,
     }
-    assert!(worth_retrying("Please retry in 19.05s"), "a rate limit is waited out, not handed to the person");
+
+    impl FailingConversation {
+        fn new(failures: impl IntoIterator<Item = Option<TurnFailure>>, session: bool) -> Self {
+            Self {
+                failures: failures.into_iter().collect(),
+                failure: None,
+                queued: Vec::new(),
+                sent: Vec::new(),
+                session: session.then(|| "saved".into()),
+                message: "provider response",
+            }
+        }
+    }
+
+    impl Conversation for FailingConversation {
+        fn send(&mut self, text: &str) {
+            self.sent.push(text.into());
+            self.failure = self.failures.pop_front().flatten();
+            self.queued.push(if self.failure.is_some() {
+                AgentEvent::Error { message: self.message.into(), remediation: None, log: None }
+            } else {
+                AgentEvent::TextDelta { text: "Done".into() }
+            });
+            self.queued.push(AgentEvent::TurnDone { backend: "scripted".into(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false });
+        }
+        fn session_id(&self) -> Option<String> {
+            self.session.clone()
+        }
+        fn continues_session(&self) -> bool {
+            self.session.is_some()
+        }
+        fn last_failure(&self) -> Option<TurnFailure> {
+            self.failure
+        }
+        fn poll(&mut self) -> Vec<AgentEvent> {
+            std::mem::take(&mut self.queued)
+        }
+        fn answer_consent(&mut self, _: &str, _: bool) {}
+        fn stop(&mut self) {}
+        fn is_busy(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn transient_failures_retry_without_requiring_an_external_session() {
+        for saved in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+            let mut worker = check_worker(&ws, false);
+            let failure = TurnFailure { kind: FailureKind::RateLimited, retry_after_secs: Some(2) };
+            let mut agent = FailingConversation::new([Some(failure), None], saved);
+            agent.message = "Authentication and billing service restarting. Please retry in 90s.";
+            let mut waits = Vec::new();
+            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build the requested app", None, |_, seconds| {
+                waits.push(seconds);
+                Ok(())
+            });
+            assert_eq!(result.unwrap(), "Done");
+            assert_eq!(waits, [3], "typed provider wait overrides the text hint");
+            assert_eq!(agent.sent.len(), 2);
+            assert_eq!(agent.sent[0], "Build the requested app");
+            assert_eq!(agent.sent[1], if saved { crate::failure::CONTINUE_TURN } else { "Build the requested app" });
+        }
+    }
+
+    #[test]
+    fn setup_errors_do_not_retry_even_with_a_wait_in_the_message() {
+        for kind in [
+            FailureKind::Authentication,
+            FailureKind::Billing,
+            FailureKind::MissingProgram,
+            FailureKind::ToolsUnavailable,
+            FailureKind::Configuration,
+            FailureKind::Unknown,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+            let mut worker = check_worker(&ws, false);
+            let mut agent = FailingConversation::new([Some(TurnFailure::new(kind))], true);
+            agent.message = "需要修改设置。Please retry in 1s.";
+            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build it", None, |_, _| panic!("a setup error must not wait and retry"));
+            assert!(result.is_err(), "{kind:?}");
+            assert_eq!(agent.sent.len(), 1, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn retries_are_bounded_and_cancelled_waits_send_nothing_more() {
+        assert_eq!(RunOptions::default().max_rounds, 6, "room to keep fixing until it works");
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let failure = TurnFailure::new(FailureKind::Transient);
+        let mut agent = FailingConversation::new([Some(failure); 5], false);
+        let mut waits = Vec::new();
+        assert!(
+            worker
+                .turn_with_wait(&mut ws, &mut agent, "Build it", None, |_, seconds| {
+                    waits.push(seconds);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(agent.sent.len(), 4, "initial attempt and at most three retries");
+        assert_eq!(waits, [30, 60, 90]);
+        let mut agent = FailingConversation::new([Some(failure)], false);
+        let error = worker
+            .turn_with_wait(&mut ws, &mut agent, "Build it", None, |stop, _| {
+                stop.cancel();
+                stop.check()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(agent.sent.len(), 1);
+    }
+
+    #[test]
+    fn a_local_self_check_write_error_is_not_retried_as_a_backend_rate_limit() {
+        #[derive(Clone)]
+        struct BlockReply {
+            answer: PathBuf,
+        }
+        impl Check for BlockReply {
+            fn id(&self) -> &'static str {
+                "blocked-reply"
+            }
+            fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
+                // The request was pending when the run read it; its answer now cannot be
+                // written. The workspace itself remains writable, including retry status.
+                std::fs::create_dir_all(&self.answer).unwrap();
+                Ok(CheckResult::new(Check::id(self), cx.round, true, "The check finished."))
+            }
+        }
+        impl TargetKind for BlockReply {
+            fn id(&self) -> &'static str {
+                "blocked-reply"
+            }
+            fn words(&self) -> KindWords {
+                SlidesKind.words()
+            }
+            fn detect(&self, _: &DetectCx) -> Option<u32> {
+                Some(1)
+            }
+            fn default_stack(&self, cx: &DetectCx) -> &'static str {
+                SlidesKind.default_stack(cx)
+            }
+            fn goal(&self) -> &'static str {
+                SlidesKind.goal()
+            }
+            fn checks(&self, _: &Workspace) -> Vec<Box<dyn Check>> {
+                vec![Box::new(self.clone())]
+            }
+        }
+        struct RateLimited {
+            sent: usize,
+            first_poll: bool,
+        }
+        impl Conversation for RateLimited {
+            fn send(&mut self, _: &str) {
+                self.sent += 1;
+                self.first_poll = true;
+            }
+            fn poll(&mut self) -> Vec<AgentEvent> {
+                vec![if std::mem::take(&mut self.first_poll) {
+                    AgentEvent::Error { message: "The provider is rate limited.".into(), remediation: None, log: None }
+                } else {
+                    AgentEvent::TurnDone { backend: "scripted".into(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false }
+                }]
+            }
+            fn last_failure(&self) -> Option<TurnFailure> {
+                Some(TurnFailure::new(FailureKind::RateLimited))
+            }
+            fn answer_consent(&mut self, _: &str, _: bool) {}
+            fn stop(&mut self) {}
+            fn is_busy(&self) -> bool {
+                false
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let asks = Inbox::new(self_check::asks_dir(&ws.root));
+        let id = asks.post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        worker.self_check = Some((Arc::new(BlockReply { answer: asks.dir().join(format!("{id}.answer.json")) }), 90.0));
+        let mut agent = RateLimited { sent: 0, first_poll: false };
+        let mut waits = Vec::new();
+        let error = worker
+            .turn_with_wait(&mut ws, &mut agent, "Build the app", None, |_, seconds| {
+                waits.push(seconds);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(agent.sent, 1, "a backend's retry hint cannot retry a local persistence failure");
+        assert!(waits.is_empty());
+        assert_ne!(error.code, ErrorCode::ProgramFailed);
+        assert!(error.message.contains(".answer.json"), "the original local failure is retained: {error:?}");
+    }
+
+    #[test]
+    fn an_api_rate_limit_continues_history_without_repeating_users_or_completed_tools() {
+        use crate::agent::tests::{Scripted, turn};
+        use crate::agent::{ApiConversation, EngineHost, LoopConfig, ModelSlot};
+        use crate::model::{Block, Speaker, StopReason};
+        for write_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ws = Workspace::create(dir.path(), "x", "Build a notes app", TargetRef::None).unwrap();
+            let mut worker = check_worker(&ws, false);
+            worker.attach(&ws).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            worker.tx = tx;
+            let seen = Arc::default();
+            let mut script = Scripted { turns: VecDeque::new(), seen: Arc::clone(&seen) };
+            if write_first {
+                script.turns.push_back(turn(
+                    vec![Block::ToolUse {
+                        id: "write-once".into(),
+                        name: "build_file_write".into(),
+                        input: json!({"path":"app/README.md","content":"Built once"}),
+                    }],
+                    StopReason::ToolUse,
+                ));
+            }
+            script.turns.push_back(Err(ToolError::new(ErrorCode::OverLimit, "服务限流").with_details(json!({"status":429,"retry_after_secs":3}))));
+            script.turns.push_back(turn(vec![Block::Text { text: "Built the notes app".into() }], StopReason::EndTurn));
+            let slot = ModelSlot { name: "Scripted".into(), model: Box::new(script), local: false, effort: None, max_turns: 10, context_tokens: 0 };
+            let enabled = std::collections::BTreeSet::from([craft_anything_engine::Toolset::Core, craft_anything_engine::Toolset::Build]);
+            let mut api = ApiConversation::start_with(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default(), enabled).unwrap();
+            let mut waits = Vec::new();
+            assert_eq!(
+                worker
+                    .turn_with_wait(&mut ws, &mut api, "Build the notes app", None, |_, seconds| {
+                        waits.push(seconds);
+                        Ok(())
+                    })
+                    .unwrap(),
+                "Built the notes app"
+            );
+            assert_eq!(waits, [4]);
+            assert!(ws.manifest.agent_session.is_none());
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), if write_first { 3 } else { 2 });
+            let before_retry = &requests[requests.len() - 2];
+            let after_retry = requests.last().unwrap();
+            assert_eq!(before_retry, after_retry, "retry must continue the same model request");
+            assert_eq!(after_retry.iter().filter(|m| m.role == Speaker::User && m.text() == "Build the notes app").count(), 1);
+            let calls = rx.try_iter().filter(|e| matches!(e, RunEvent::Agent(AgentEvent::ToolStarted { tool, .. }) if tool == "build_file_write")).count();
+            assert_eq!(calls, usize::from(write_first), "a completed write is not replayed");
+            if write_first {
+                assert_eq!(std::fs::read_to_string(ws.app_dir().join("README.md")).unwrap(), "Built once");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn executable_cli(ws: &Workspace, model: &str, script: &str) -> crate::cli_agents::CliConversation {
+        use std::os::unix::fs::PermissionsExt;
+        let program = ws.root.join("agent-stand-in.sh");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = crate::BackendConfig {
+            name: "Scripted CLI".into(),
+            kind: BackendKind::AgentCli,
+            model: model.into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        };
+        let options = crate::BackendOptions { command: Some(program.display().to_string()), timeout_secs: Some(10), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        spec.project = Some(ws.root.clone());
+        spec.preamble = Some(String::new());
+        crate::cli_agents::CliConversation::new(spec)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_required_tool_server_stops_the_owned_cli_without_resuming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.tx = tx;
+        let mut cli = executable_cli(
+            &ws,
+            "claude-code",
+            concat!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'attempt\\n' >> attempts\n",
+                "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"cannot-build\",\"mcp_servers\":[{\"name\":\"craft-anything\",\"status\":\"failed\"}]}'\n",
+                "sleep 5\nprintf 'unreachable' > continued-without-tools\n"
+            ),
+        );
+        let error = worker.turn_with_wait(&mut ws, &mut cli, "Build the app", None, |_, _| panic!("missing tools must not be retried")).unwrap_err();
+        assert!(error.message.contains("tools did not start"), "{error:?}");
+        assert_eq!(cli.last_failure().unwrap().kind, FailureKind::ToolsUnavailable);
+        assert!(!cli.is_busy());
+        assert_eq!(std::fs::read_to_string(ws.root.join("attempts")).unwrap(), "attempt\n");
+        assert!(!ws.root.join("continued-without-tools").exists(), "the owned child was stopped at the failed init");
+        assert_eq!(rx.try_iter().filter(|e| matches!(e, RunEvent::Agent(AgentEvent::TurnDone { .. }))).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_nonzero_cli_exit_resumes_its_saved_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.tx = tx;
+        let mut cli = executable_cli(
+            &ws,
+            "claude-code",
+            concat!(
+                "#!/bin/sh\ncat >> prompts\nprintf '\\n' >> prompts\nprintf 'attempt\\n' >> attempts\n",
+                "case \" $* \" in *\" --resume interrupted-session \"*)\n",
+                "printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Built after the interruption\"}]}}'\n",
+                "printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Built after the interruption\"}'\nexit 0;; esac\n",
+                "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"interrupted-session\"}'\nexit 1\n"
+            ),
+        );
+        let mut waits = Vec::new();
+        let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+            waits.push(seconds);
+            Ok(())
+        });
+        assert_eq!(std::fs::read_to_string(ws.root.join("attempts")).unwrap(), "attempt\nattempt\n", "a plain nonzero exit must resume the reported session");
+        assert_eq!(result.unwrap(), "Built after the interruption");
+        assert_eq!(waits, [30]);
+        assert_eq!(std::fs::read_to_string(ws.root.join("prompts")).unwrap(), format!("Make a notes app\n{}\n", crate::failure::CONTINUE_TURN));
+        assert_eq!(cli.session_id().as_deref(), Some("interrupted-session"));
+        assert!(cli.last_failure().is_none(), "successful recovery clears the process failure");
+        assert!(!cli.is_busy());
+        assert_eq!(rx.try_iter().filter(|e| matches!(e, RunEvent::Agent(AgentEvent::TurnDone { .. }))).count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_cli_setup_errors_take_precedence_over_a_nonzero_exit() {
+        for (code, kind) in
+            [("authentication_failed", FailureKind::Authentication), ("billing_error", FailureKind::Billing), ("model_not_found", FailureKind::Configuration)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+            let mut worker = check_worker(&ws, false);
+            let error = json!({"type":"assistant","error":code,"message":{"content":[{"type":"text","text":"Please retry in 1s."}]}});
+            let script = format!("#!/bin/sh\ncat >/dev/null\nprintf 'attempt\\n' >> attempts\nprintf '%s\\n' '{error}'\nexit 1\n");
+            let mut cli = executable_cli(&ws, "claude-code", &script);
+            let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, _| panic!("typed setup failures must not retry"));
+            assert!(result.is_err(), "{kind:?}");
+            assert_eq!(cli.last_failure().unwrap().kind, kind);
+            assert_eq!(std::fs::read_to_string(ws.root.join("attempts")).unwrap(), "attempt\n");
+            assert!(!cli.is_busy());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_retries_a_typed_rate_limit_with_its_whole_original_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.tx = tx;
+        let mut cli = executable_cli(
+            &ws,
+            "opencode",
+            concat!(
+                "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format'; exit 0; fi\n",
+                "for arg do last=\"$arg\"; done\nprintf '%s\\n' \"$last\" >> prompts\n",
+                "if [ ! -f rate-was-returned ]; then touch rate-was-returned\n",
+                "printf '%s\\n' '{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Please retry in 19.052906498s.\",\"statusCode\":429,\"isRetryable\":true}}}'\nexit 1\nfi\n",
+                "printf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"Built the app\"}}'\n"
+            ),
+        );
+        let mut waits = Vec::new();
+        assert_eq!(
+            worker
+                .turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+                    waits.push(seconds);
+                    Ok(())
+                })
+                .unwrap(),
+            "Built the app"
+        );
+        assert_eq!(waits, [21]);
+        assert_eq!(std::fs::read_to_string(ws.root.join("prompts")).unwrap(), "Make a notes app\nMake a notes app\n");
+        assert!(cli.session_id().is_none());
+        assert!(cli.last_failure().is_none(), "successful retry clears the prior failure");
+        assert!(!cli.is_busy());
+        assert_eq!(rx.try_iter().filter(|e| matches!(e, RunEvent::Agent(AgentEvent::TurnDone { .. }))).count(), 2, "one final event per process attempt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untyped_opencode_exit_keeps_its_error_and_the_three_retry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let mut cli = executable_cli(
+            &ws,
+            "opencode",
+            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf 'old help\\n'; exit 0; fi\nprintf 'attempt\\n' >> attempts\nprintf 'Unknown option: --format. Please retry in 1s.\\n' >&2\nexit 2\n",
+        );
+        let mut waits = Vec::new();
+        let error = worker
+            .turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+                waits.push(seconds);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.message.contains("Unknown option"), "{error:?}");
+        assert_eq!(cli.last_failure().unwrap().kind, FailureKind::Transient);
+        assert!(!cli.is_busy());
+        assert_eq!(waits, [2, 2, 2], "the display wait hint affects only the delay after a retryable exit");
+        assert_eq!(std::fs::read_to_string(ws.root.join("attempts")).unwrap(), "attempt\nattempt\nattempt\nattempt\n");
+    }
 }
 
 #[test]
@@ -560,6 +977,32 @@ fn website_kind_compares_only_when_there_is_an_original() {
     assert_eq!(ids(&scratch), [CheckResult::BUILD]);
 }
 
+/// #494: the website check, run for real with no site to look at, fails with a note that names the
+/// places a site is accepted and where the app is: `app/`, or the project folder for a project
+/// that edits its own folder.
+#[test]
+fn the_website_check_with_no_site_says_where_it_looked() {
+    let d = tempfile::tempdir().unwrap();
+    for in_root in [false, true] {
+        let mut ws = Workspace::create(
+            &d.path().join(if in_root { "root" } else { "app" }),
+            "Site",
+            "Clone it",
+            TargetRef::Website { url: "https://example.com".into() },
+        )
+        .unwrap();
+        ws.manifest.app_in_root = in_root;
+        let place = if in_root { "the project folder" } else { "app/" };
+        let r = check_worker(&ws, false).run_checks(&ws, &kinds::WebsiteKind, 1).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].passed && r[0].check == CheckResult::WEB_VISUAL, "{:?}", r[0]);
+        let note = &r[0].note;
+        assert!(note.contains(&format!("No built site found in {place} yet")), "{note}");
+        assert!(note.contains(&format!("index.html straight in {place}")) && note.contains("dist/, build/ or out/"), "{note}");
+        assert!(in_root || !note.contains("project folder"), "{note}");
+    }
+}
+
 #[test]
 fn a_picked_game_is_rebuilt_with_its_own_engine_when_we_can() {
     let d = tempfile::tempdir().unwrap();
@@ -598,6 +1041,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     w.attach(&ws).unwrap();
     // The model writes a file with the Build tools, then answers.
@@ -609,7 +1053,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         ]),
         seen: Arc::default(),
     };
-    let slot = ModelSlot { name: "Scripted".into(), model: Box::new(script), local: false, effort: None, max_turns: 10 };
+    let slot = ModelSlot { name: "Scripted".into(), model: Box::new(script), local: false, effort: None, max_turns: 10, context_tokens: 0 };
     let enabled = std::collections::BTreeSet::from([craft_anything_engine::Toolset::Core, craft_anything_engine::Toolset::Build]);
     let mut api = ApiConversation::start_with(Arc::new(EngineHost(engine)), vec![slot], LoopConfig::default(), enabled).unwrap();
     let reply = w.turn(&mut ws, &mut api, "Build it.", None).unwrap();
@@ -714,6 +1158,7 @@ fn the_mechanics_sheet_is_required_and_held_against_the_code() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     let check = |round| w.run_checks(&ws, &SheetKind, round).unwrap().remove(0);
 
@@ -798,6 +1243,10 @@ mod picking_up_a_build {
             "flaky"
         }
         fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
+            let rejection = std::fs::read_to_string(cx.ws.root.join("reject-build")).unwrap_or_default();
+            if !rejection.is_empty() && (rejection != "once" || cx.ws.manifest.checks.is_empty()) {
+                return Ok(CheckResult::new(self.id(), cx.round, false, "The app is still missing."));
+            }
             let file = cx.ws.app_dir().join("check-fails");
             let left: u32 = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
             if left > 0 {
@@ -862,12 +1311,43 @@ mod picking_up_a_build {
         Bench { _dir: dir, hub, projects, prompts }
     }
 
+    /// The stand-in continues its session, as Claude Code and Codex do: it's handed the saved one,
+    /// which it notes at the top of the prompt it writes down ("(resuming …)").
+    struct StandIn;
+
+    impl crate::cli_agents::AgentAdapter for StandIn {
+        fn ids(&self) -> &'static [&'static str] {
+            &["stand-in"]
+        }
+        fn args(&self, cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
+            let resuming = cx.resume.map(|id| format!("(resuming {id})\n")).unwrap_or_default();
+            let mut a = cx.options.args.clone();
+            a.push(format!("{resuming}{}{}", cx.preamble, cx.prompt));
+            a
+        }
+        fn streams_json(&self) -> bool {
+            false
+        }
+        fn resumes(&self) -> bool {
+            true
+        }
+    }
+
     fn try_it(b: &Bench, ws: &Workspace) -> (bool, Vec<feed::FeedItem>) {
-        let mut kinds = KindRegistry::built_in();
-        kinds.register(Arc::new(FlakyKind));
-        let run =
-            RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), RunOptions { kinds, backend: Some("Stand-in".into()), ..RunOptions::default() })
-                .unwrap();
+        try_with(b, ws, RunOptions::default())
+    }
+
+    fn try_with(b: &Bench, ws: &Workspace, mut opts: RunOptions) -> (bool, Vec<feed::FeedItem>) {
+        opts.adapters.register(Arc::new(StandIn));
+        run_with(b, ws, opts)
+    }
+
+    /// [`try_with`] with the adapters `opts` has (the built-in ones: the plain adapter, which
+    /// doesn't resume, drives the stand-in).
+    fn run_with(b: &Bench, ws: &Workspace, mut opts: RunOptions) -> (bool, Vec<feed::FeedItem>) {
+        opts.kinds.register(Arc::new(FlakyKind));
+        opts.backend = Some("Stand-in".into());
+        let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
         let began = Instant::now();
         let mut ok = None;
         while ok.is_none() {
@@ -964,8 +1444,406 @@ mod picking_up_a_build {
         assert!(ok, "{feed:?}");
         assert!(!studied(&feed), "the original isn't studied again");
         let told = std::fs::read_to_string(&b.prompts).unwrap();
-        assert!(told.contains("Pick up where you left off"), "{told}");
+        assert!(told.contains("Pick up where you left off") && told.starts_with("(resuming session-1)"), "{told}");
         assert!(!told.contains("Their request"), "not the first-build brief again: {told}");
+    }
+
+    /// A builder that starts every run afresh (it doesn't resume) is given the whole brief, and
+    /// the project it has worked on still counts as started: a check that couldn't run leaves the
+    /// build to check, and Try again only checks, as it does for one that resumes.
+    #[test]
+    fn a_builder_that_doesnt_resume_gets_the_brief_and_try_again_still_only_checks() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.app_dir().join("check-fails"), "2").unwrap();
+        let (ok, _) = run_with(&b, &ws, RunOptions::default());
+        assert!(!ok, "the check couldn't run");
+        assert_eq!(prompts_given(&b), 1);
+        let told = std::fs::read_to_string(&b.prompts).unwrap();
+        assert!(told.contains("Their request") && told.contains("Pick up where you left off") && !told.contains("(resuming"), "{told}");
+        let saved = Workspace::open(&ws.root).unwrap();
+        assert!(saved.manifest.awaiting_check && saved.builder_started(), "the builder's turn is on record");
+        let (ok, feed) = run_with(&b, &saved, RunOptions::default());
+        assert!(ok, "{feed:?}");
+        assert_eq!(prompts_given(&b), 1, "Try again only checks");
+        assert!(!studied(&feed), "the original isn't studied again");
+    }
+
+    #[test]
+    fn unchanged_builder_turns_stop_after_two_and_stay_stopped_when_reopened() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+        let (ok, feed) = try_it(&b, &ws);
+        assert!(!ok, "{feed:?}");
+        assert_eq!(prompts_given(&b), 2, "a third unchanged turn would spend more without progress");
+        assert!(
+            feed.iter().any(|i| matches!(i, feed::FeedItem::Error { message, .. } if message.contains("two builder turns"))),
+            "the stop explains what happened: {feed:?}"
+        );
+        let reopened = Workspace::open(&ws.root).unwrap();
+        let (ok, _) = try_it(&b, &reopened);
+        assert!(!ok);
+        assert_eq!(prompts_given(&b), 2, "Try again must keep the saved progress limit");
+    }
+
+    #[test]
+    fn single_turn_runs_share_the_same_unchanged_turn_limit() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+        for expected in [1, 2, 2] {
+            let (ok, _) = try_with(&b, &ws, RunOptions { max_rounds: 0, ..RunOptions::default() });
+            assert!(!ok);
+            assert_eq!(prompts_given(&b), expected);
+        }
+    }
+
+    #[test]
+    fn a_real_edit_or_nonempty_new_request_starts_another_attempt() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+        assert!(!try_it(&b, &ws).0);
+        assert_eq!(prompts_given(&b), 2);
+        std::fs::write(ws.app_dir().join("index.html"), "a new starting point").unwrap();
+        assert!(!try_it(&b, &ws).0);
+        assert_eq!(prompts_given(&b), 4, "a real edit reset the previous limit");
+        let opts = RunOptions { message: Some("Use the new index.html and add a working button.".into()), ..RunOptions::default() };
+        assert!(!try_with(&b, &ws, opts).0);
+        assert_eq!(prompts_given(&b), 6, "a new request starts another attempt");
+        let empty = RunOptions { message: Some("   ".into()), ..RunOptions::default() };
+        assert!(!try_with(&b, &ws, empty).0);
+        assert_eq!(prompts_given(&b), 6, "an empty message cannot erase the saved count");
+    }
+
+    #[test]
+    fn a_successful_check_can_finish_the_second_unchanged_turn() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "once").unwrap();
+        assert!(try_it(&b, &ws).0);
+        assert_eq!(prompts_given(&b), 2);
+        assert_eq!(BuildProgress::load(&ws.root).unwrap().unchanged_turns, 2);
+    }
+
+    #[test]
+    fn a_saved_check_only_run_is_not_blocked_by_the_progress_limit() {
+        let b = bench();
+        let mut ws = worked_on(&b);
+        ws.manifest.awaiting_check = true;
+        ws.save().unwrap();
+        let mut progress = BuildProgress::load(&ws.root).unwrap();
+        progress.before_turn(ws.app_fingerprint(&CancelToken::default()).unwrap());
+        progress.unchanged_turns = 2;
+        progress.save(&ws.root).unwrap();
+        assert!(try_it(&b, &ws).0);
+        assert_eq!(prompts_given(&b), 0);
+    }
+
+    #[test]
+    fn a_failed_check_only_resume_detects_manual_edits_before_refusing_more_build_turns() {
+        for edited in [false, true] {
+            let b = bench();
+            let mut ws = worked_on(&b);
+            std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+            ws.manifest.awaiting_check = true;
+            ws.save().unwrap();
+            let mut progress = BuildProgress::load(&ws.root).unwrap();
+            progress.before_turn(ws.app_fingerprint(&CancelToken::default()).unwrap());
+            progress.unchanged_turns = 2;
+            progress.save(&ws.root).unwrap();
+            if edited {
+                std::fs::write(ws.app_dir().join("index.html"), "a manual correction").unwrap();
+            }
+            assert!(!try_it(&b, &ws).0);
+            assert_eq!(prompts_given(&b), if edited { 2 } else { 0 }, "edited={edited}");
+            assert_eq!(BuildProgress::load(&ws.root).unwrap().unchanged_turns, 2);
+        }
+    }
+
+    #[test]
+    fn scan_io_errors_skip_only_the_guard_and_cancellation_is_never_skipped() {
+        for fail_scan_first in [false, true] {
+            let b = bench();
+            let ws = worked_on(&b);
+            let worker = check_worker(&ws, false);
+            let mut progress = BuildProgress::default();
+            progress.before_turn(ws.app_fingerprint(&CancelToken::default()).unwrap());
+            progress.unchanged_turns = 2;
+            progress.save(&ws.root).unwrap();
+            let mut available = true;
+            let mut fingerprints = AppFingerprintCache::default();
+            if fail_scan_first {
+                // A deterministic read_dir I/O failure, including when tests run as root.
+                std::fs::remove_dir(ws.app_dir()).unwrap();
+                std::fs::write(ws.app_dir(), "the app directory is temporarily unavailable").unwrap();
+                assert!(worker.progress_fingerprint(&ws, &mut progress, &mut available, &mut fingerprints).unwrap().is_none());
+                assert!(!available);
+                assert_eq!(progress, BuildProgress::default());
+                assert_eq!(BuildProgress::load(&ws.root).unwrap(), progress);
+                std::fs::remove_file(ws.app_dir()).unwrap();
+                std::fs::create_dir(ws.app_dir()).unwrap();
+                assert!(
+                    worker.progress_fingerprint(&ws, &mut progress, &mut available, &mut fingerprints).unwrap().is_none(),
+                    "a recovered directory does not resume comparisons within the same run"
+                );
+            }
+            let before = progress.clone();
+            worker.stop.cancel();
+            assert_eq!(worker.progress_fingerprint(&ws, &mut progress, &mut available, &mut fingerprints).unwrap_err().code, ErrorCode::Cancelled);
+            assert_eq!(progress, before, "cancellation does not erase a known comparison");
+            assert_eq!(BuildProgress::load(&ws.root).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn a_skipped_scan_does_not_hide_the_builders_own_failure() {
+        let b = bench();
+        let ws = worked_on(&b);
+        let nested = (0..65).fold(ws.app_dir().join("nested"), |p, _| p.join("d"));
+        std::fs::create_dir_all(nested).unwrap();
+        // Authentication is a typed provider failure. A plain exit 1 is transient, regardless
+        // of the English words it prints, and is covered by the retry-policy tests.
+        let mut config = b.hub.config();
+        let mut entry = config.get("Stand-in").unwrap().clone();
+        entry.config.model = "opencode".into();
+        config.upsert(entry);
+        b.hub.engine.session().settings.ai = config.to_table().unwrap();
+        let agent = b._dir.path().join("agent.sh");
+        let script = std::fs::read_to_string(&agent).unwrap();
+        let script = script.replacen("#!/bin/sh\n", "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format'; exit 0; fi\n", 1);
+        let error = json!({"type":"error","error":{"name":"APIError","data":{"message":"fixture sign in needed","statusCode":401,"isRetryable":false}}});
+        std::fs::write(&agent, script.replace("echo Done.", &format!("printf '%s\\n' '{error}'\nexit 1"))).unwrap();
+        let (ok, feed) = try_it(&b, &ws);
+        assert!(!ok);
+        assert_eq!(prompts_given(&b), 1, "the unavailable scan does not block or repeat the builder");
+        assert!(feed.iter().any(|i| matches!(i, feed::FeedItem::Error { message, .. } if message.contains("fixture sign in needed"))), "{feed:?}");
+        let saved = Workspace::open(&ws.root).unwrap();
+        assert!(!saved.manifest.awaiting_check, "a failed turn has not finished its build");
+        assert!(saved.manifest.checks.is_empty(), "the failed builder is not described as a successful check");
+    }
+
+    #[test]
+    fn scan_limits_do_not_block_builds_or_keep_a_stale_stall_count() {
+        for only_check in [false, true] {
+            let b = bench();
+            let mut ws = worked_on(&b);
+            let mut progress = BuildProgress::default();
+            progress.before_turn(ws.app_fingerprint(&CancelToken::default()).unwrap());
+            progress.unchanged_turns = 2;
+            progress.save(&ws.root).unwrap();
+            ws.manifest.awaiting_check = only_check;
+            ws.save().unwrap();
+            let nested = (0..65).fold(ws.app_dir().join("nested"), |p, _| p.join("d"));
+            std::fs::create_dir_all(&nested).unwrap();
+            assert_eq!(ws.app_fingerprint(&CancelToken::default()).unwrap_err().code, ErrorCode::OverLimit);
+            std::fs::write(ws.root.join("reject-build"), "once").unwrap();
+            let (ok, feed) = try_it(&b, &ws);
+            assert!(ok, "a scan limit must not fail the build (only_check={only_check}): {feed:?}");
+            assert_eq!(prompts_given(&b), if only_check { 1 } else { 2 });
+            assert_eq!(BuildProgress::load(&ws.root).unwrap(), BuildProgress::default(), "an unknown comparison breaks the saved streak");
+            let notices = feed
+                .iter()
+                .filter_map(|i| match i {
+                    feed::FeedItem::Work { notes, .. } => Some(notes.iter().filter(|n| n.contains("without the unchanged-turn limit")).count()),
+                    _ => None,
+                })
+                .sum::<usize>();
+            assert_eq!(notices, 1, "one notice explains that this run skipped the unavailable guard");
+            assert_eq!(Workspace::open(&ws.root).unwrap().manifest.status, Status::Ready);
+            std::fs::remove_dir_all(ws.app_dir().join("nested")).unwrap();
+            assert!(try_it(&b, &ws).0);
+            assert_eq!(BuildProgress::load(&ws.root).unwrap().unchanged_turns, 1, "the next readable run starts a new comparison");
+        }
+    }
+
+    #[test]
+    fn a_post_turn_scan_limit_keeps_the_finished_turn_for_check_only_recovery() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.app_dir().join("check-fails"), "2").unwrap();
+        let nested = (0..65).fold(ws.app_dir().join("nested"), |p, _| p.join("d"));
+        let agent = b._dir.path().join("agent.sh");
+        let script = std::fs::read_to_string(&agent).unwrap();
+        std::fs::write(&agent, format!("{script}\nmkdir -p '{}'\n", nested.display())).unwrap();
+        let (ok, feed) = try_it(&b, &ws);
+        assert!(!ok, "the original check failure still stops the run");
+        let saved = Workspace::open(&ws.root).unwrap();
+        assert!(saved.manifest.awaiting_check, "the successful builder turn is saved before an unavailable scan");
+        assert_eq!(saved.manifest.last_reply, "Done.");
+        assert_eq!(prompts_given(&b), 1);
+        assert_eq!(BuildProgress::load(&ws.root).unwrap(), BuildProgress::default());
+        assert!(
+            feed.iter().any(|i| matches!(i, feed::FeedItem::Error { message, .. } if message.contains("The build is finished, but it couldn't be checked"))),
+            "{feed:?}"
+        );
+        assert!(try_it(&b, &saved).0, "Try again can finish the checks while the scan is still unavailable");
+        assert_eq!(prompts_given(&b), 1, "the completed builder turn is not repeated");
+        assert!(!Workspace::open(&ws.root).unwrap().manifest.awaiting_check);
+    }
+
+    #[test]
+    fn an_api_builder_has_the_same_two_unchanged_turn_limit() {
+        use crate::agent::tests::{Scripted, turn};
+        use crate::agent::{ApiConversation, EngineHost, LoopConfig, ModelSlot};
+        use crate::model::{Block, StopReason};
+        let b = bench();
+        let mut ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+        let seen = Arc::default();
+        let script = Scripted {
+            turns: (0..5).map(|_| turn(vec![Block::Text { text: "No files changed.".into() }], StopReason::EndTurn)).collect(),
+            seen: Arc::clone(&seen),
+        };
+        let mut worker = check_worker(&ws, false);
+        let slot = ModelSlot { name: "Scripted".into(), model: Box::new(script), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+        let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
+        let entry = crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "Scripted".into(),
+                kind: BackendKind::OpenaiCompatible,
+                model: "scripted".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            },
+            options: Default::default(),
+        };
+        let mut opts = RunOptions::default();
+        opts.kinds.register(Arc::new(FlakyKind));
+        let error = worker.run(&mut ws, entry, Some(api), None, &opts).unwrap_err();
+        assert!(error.message.contains("two builder turns"), "{error:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn new_notes_during_a_turn_or_check_get_their_own_attempt_but_empty_notes_do_not() {
+        use crate::agent::tests::{Scripted, turn};
+        use crate::agent::{ApiConversation, EngineHost, LoopConfig, ModelSlot};
+        use crate::model::{Block, ChatModel, Delta, Stop, StopReason, TurnRequest, TurnResult};
+        type Notes = Arc<Mutex<Vec<Note>>>;
+        fn note(text: &str) -> Note {
+            Note { id: 42, text: text.into(), shown: text.into(), pictures: Vec::new() }
+        }
+        struct NoteModel {
+            script: Scripted,
+            notes: Notes,
+            add: bool,
+            claim: bool,
+            dir: std::path::PathBuf,
+            text: &'static str,
+        }
+        impl ChatModel for NoteModel {
+            fn turn(&mut self, req: &TurnRequest<'_>, delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
+                if self.add && self.script.seen.lock().unwrap().len() == 1 {
+                    self.notes.lock().unwrap().push(note(self.text));
+                    if self.claim {
+                        notes::hand_over(&self.dir, 42, self.text).unwrap();
+                        assert_eq!(notes::claim(&self.dir), [self.text]);
+                    }
+                }
+                self.script.turn(req, delta, stop)
+            }
+            fn model(&self) -> String {
+                self.script.model()
+            }
+        }
+        struct NoteCheck {
+            notes: Notes,
+            add: bool,
+            text: &'static str,
+        }
+        impl Check for NoteCheck {
+            fn id(&self) -> &'static str {
+                "note-check"
+            }
+            fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
+                if self.add && cx.round == 2 {
+                    self.notes.lock().unwrap().push(note(self.text));
+                }
+                Ok(CheckResult::new(self.id(), cx.round, false, "The app is still missing."))
+            }
+        }
+        struct NoteKind {
+            notes: Notes,
+            add: bool,
+            text: &'static str,
+        }
+        impl TargetKind for NoteKind {
+            fn id(&self) -> &'static str {
+                "note-kind"
+            }
+            fn words(&self) -> KindWords {
+                FlakyKind.words()
+            }
+            fn detect(&self, _: &DetectCx) -> Option<u32> {
+                Some(1001)
+            }
+            fn default_stack(&self, _: &DetectCx) -> &'static str {
+                "Anything"
+            }
+            fn goal(&self) -> &'static str {
+                "a thing"
+            }
+            fn checks(&self, _: &Workspace) -> Vec<Box<dyn Check>> {
+                vec![Box::new(NoteCheck { notes: self.notes.clone(), add: self.add, text: self.text })]
+            }
+        }
+        for mode in ["queued-turn", "queued-check", "hook"] {
+            for text in ["Use the built-in renderer", "   "] {
+                let b = bench();
+                let mut ws = worked_on(&b);
+                let mut worker = check_worker(&ws, false);
+                let seen = Arc::default();
+                let script = Scripted {
+                    turns: (0..5).map(|_| turn(vec![Block::Text { text: "No files changed.".into() }], StopReason::EndTurn)).collect(),
+                    seen: Arc::clone(&seen),
+                };
+                let model = NoteModel {
+                    script,
+                    notes: worker.notes.clone(),
+                    add: mode != "queued-check",
+                    claim: mode == "hook",
+                    dir: notes::notes_dir(&ws.inbox_dir()),
+                    text,
+                };
+                let slot = ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+                let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
+                let entry = crate::BackendEntry {
+                    config: crate::BackendConfig {
+                        name: "Scripted".into(),
+                        kind: BackendKind::OpenaiCompatible,
+                        model: "scripted".into(),
+                        base_url: None,
+                        ssh_host: None,
+                        enabled: true,
+                    },
+                    options: Default::default(),
+                };
+                let mut opts = RunOptions::default();
+                opts.kinds.register(Arc::new(NoteKind { notes: worker.notes.clone(), add: mode == "queued-check", text }));
+                let error = worker.run(&mut ws, entry, Some(api), None, &opts).unwrap_err();
+                assert!(error.message.contains("two builder turns"), "{error:?}");
+                let requests = seen.lock().unwrap();
+                let expected = if text.trim().is_empty() {
+                    2
+                } else if mode == "hook" {
+                    3
+                } else {
+                    4
+                };
+                assert_eq!(requests.len(), expected, "mode={mode}, text={text:?}");
+                if !text.trim().is_empty() && mode != "hook" {
+                    assert!(requests[2].last().unwrap().text().contains(text), "the queued instruction reaches the builder");
+                }
+                assert!(worker.notes.lock().unwrap().is_empty(), "each instruction is consumed once");
+                assert!(!notes::was_read(&notes::notes_dir(&ws.inbox_dir()), 42));
+                assert_eq!(BuildProgress::load(&ws.root).unwrap().unchanged_turns, 2);
+                assert!(!try_it(&b, &ws).0);
+                assert_eq!(prompts_given(&b), 0, "plain Try again still cannot reset the saved count");
+            }
+        }
     }
 
     /// #469: after the builder changed, the session the old one saved isn't handed to the new
@@ -978,8 +1856,10 @@ mod picking_up_a_build {
         ws.save().unwrap();
         let (ok, feed) = try_it(&b, &ws);
         assert!(ok, "{feed:?}");
+        // It starts from the whole brief, told to finish what's there, and isn't handed the other
+        // agent's session.
         let told = std::fs::read_to_string(&b.prompts).unwrap();
-        assert!(told.contains("Their request") && !told.contains("Pick up where you left off"), "{told}");
+        assert!(told.contains("Their request") && !told.contains("(resuming"), "{told}");
         let m = Workspace::open(&ws.root).unwrap().manifest;
         assert_eq!((m.agent_session, m.agent_session_by.as_deref()), (None, Some("stand-in")));
 
@@ -989,7 +1869,8 @@ mod picking_up_a_build {
         ws.save().unwrap();
         let (ok, feed) = try_it(&b, &ws);
         assert!(ok, "{feed:?}");
-        assert!(std::fs::read_to_string(&b.prompts).unwrap().contains("Pick up where you left off"));
+        let told = std::fs::read_to_string(&b.prompts).unwrap();
+        assert!(told.starts_with("(resuming session-1)") && told.contains("Pick up where you left off"), "{told}");
         assert_eq!(Workspace::open(&ws.root).unwrap().manifest.agent_session.as_deref(), Some("session-1"));
     }
 
@@ -1031,6 +1912,54 @@ mod picking_up_a_build {
         assert!(ok);
         assert_eq!(prompts_given(&b), asked, "and it isn't asked to build again");
     }
+
+    /// #736: a builder that says it built the site while app/ has no files stops after two
+    /// unchanged turns, and the build check and the stop both say nothing was written. The
+    /// reporter's release had no such stop, so its check ran 40+ times.
+    #[test]
+    fn an_empty_app_with_a_claimed_build_stops_and_says_nothing_was_written() {
+        let b = bench();
+        let mut ws = Workspace::create(&b.projects, "x", "A website for a bakery", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("session-1".into());
+        ws.save().unwrap();
+        std::fs::create_dir_all(ws.capture_dir()).unwrap();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        // The stand-in answers "Done." and writes nothing, as the reported builder did.
+        let opts = RunOptions { backend: Some("Stand-in".into()), ..RunOptions::default() };
+        let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
+        let ok = loop {
+            match run.rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(RunEvent::Finished { ok, .. }) => break ok,
+                Ok(_) => {}
+                Err(e) => panic!("the run went away: {e}"),
+            }
+        };
+        assert!(!ok);
+        assert_eq!(prompts_given(&b), 2, "a third unchanged turn would spend more without progress");
+        let saved = Workspace::open(&ws.root).unwrap();
+        let build = saved.manifest.checks.iter().find(|c| c.check == CheckResult::BUILD).expect("the build check ran");
+        assert!(build.note.contains("app/ has no files yet, so the builder hasn't written the project."), "{}", build.note);
+        let feed = feed::load(&saved);
+        assert!(
+            feed.iter().any(|i| matches!(i, feed::FeedItem::Error { message, .. }
+                if message.contains("changed no files in app/") && message.contains("app/ has no files yet"))),
+            "the stop says app/ is empty: {feed:?}"
+        );
+    }
+
+    /// The empty-folder wording is only for an empty app/: a folder with files gets the plain stop.
+    #[test]
+    fn the_stop_names_an_empty_app_and_only_then() {
+        let b = bench();
+        let ws = worked_on(&b);
+        let empty = no_build_progress(&ws);
+        assert!(empty.message.contains("app/ has no files yet"), "{empty:?}");
+        assert!(empty.remediation.as_deref().is_some_and(|r| r.contains("asks for the project's files in app/")), "{empty:?}");
+        std::fs::write(ws.app_dir().join("index.html"), "<h1>Bakery</h1>").unwrap();
+        let written = no_build_progress(&ws);
+        assert!(!written.message.contains("has no files"), "{written:?}");
+        assert_eq!(written.message, "The build stopped after two builder turns changed no files in app/.");
+    }
 }
 
 fn check_worker(ws: &Workspace, deep: bool) -> Worker {
@@ -1052,6 +1981,7 @@ fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     }
 }
 
@@ -1438,6 +2368,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     let entry = crate::BackendEntry {
         config: crate::BackendConfig {
@@ -1479,6 +2410,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         decompiled: false,
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
+        reset_progress_after_notes: false,
     };
     let mut builder = ChecksItsWork { root: ws.root.clone(), asked: None, reply: None };
     let reply = w.turn(&mut ws, &mut builder, "Build it.", None).unwrap();
@@ -1654,7 +2586,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
     let d = tempfile::tempdir().unwrap();
     let mut ws = Workspace::create(d.path(), "Site", "Clone it", TargetRef::None).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let w = Worker {
+    let mut w = Worker {
         wake: Default::default(),
         engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
         tx,
@@ -1664,14 +2596,15 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         inbox: Inbox::new(ws.inbox_dir()),
         editor: None,
         notes: Arc::new(Mutex::new(vec![
-            Note { id: 1, text: "make the header blue".into(), shown: "make the header blue".into() },
-            Note { id: 2, text: "add a footer".into(), shown: "add a footer".into() },
+            Note { id: 1, text: "make the header blue".into(), shown: "make the header blue".into(), pictures: Vec::new() },
+            Note { id: 2, text: "add a footer".into(), shown: "add a footer".into(), pictures: Vec::new() },
         ])),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     let dir = notes::notes_dir(&ws.inbox_dir());
     notes::hand_over(&dir, 1, "make the header blue").unwrap();
@@ -1681,7 +2614,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
     assert_eq!(notes::claim(&dir), ["make the header blue"]);
     std::fs::rename(dir.join("2.wait"), dir.join("2.json")).unwrap();
     w.relay_read_notes(&ws);
-    let shown: Vec<String> = rx.try_iter().filter_map(|e| if let RunEvent::Note(s) = e { Some(s) } else { None }).collect();
+    let shown: Vec<String> = rx.try_iter().filter_map(|e| if let RunEvent::Note { shown, .. } = e { Some(shown) } else { None }).collect();
     assert_eq!(shown, ["make the header blue"], "it joins the feed as soon as the builder took it");
     assert!(!notes::was_read(&dir, 1), "its files are gone");
     // After the turn, only the note nobody took is sent, and no hook can hand it over again.
@@ -1746,6 +2679,71 @@ fn a_project_started_in_a_picked_folder_stays_in_the_list() {
     assert_eq!(saved.project_folders, std::slice::from_ref(&ws.root), "saved in the session's own settings");
     let listed = Workspace::list_in(&session.settings.project_locations());
     assert!(listed.iter().any(|w| w.root == ws.root));
+}
+
+#[test]
+fn a_project_edited_in_place_keeps_what_its_files_are_built_with() {
+    use craft_anything_engine::workspace::ExistingFiles::{Edit, StartFrom};
+    let first = |file: &str, request: &str, existing| {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(file), "").unwrap();
+        let ws = Workspace::create_at(d.path(), "Mine", request, TargetRef::None, Some(existing)).unwrap();
+        project::first_stack(&KindRegistry::built_in(), &ws, false)
+    };
+    assert_eq!(first("project.godot", "Fix my game's jump", Edit), Some("Godot"), "not the Unity its words would get");
+    assert_eq!(first("requirements.txt", "Add a settings page", Edit), Some("Python"), "not the app kind's default");
+    assert_eq!(first("requirements.txt", "Move it to Electron", Edit), Some("Electron"), "the person's words come first");
+    assert_eq!(first("notes.md", "Fix my game's jump", Edit), Some("Unity"), "nothing to read: as for a new project");
+    assert_eq!(first("project.godot", "Fix my game's jump", StartFrom), Some("Unity"), "material to start from doesn't decide");
+}
+
+/// A folder of the person's own with this file in it, as a project of `existing`.
+fn own_folder(file: &str, existing: craft_anything_engine::workspace::ExistingFiles) -> (tempfile::TempDir, Workspace) {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join(file), "<p>hi</p>").unwrap();
+    let ws = Workspace::create_at(d.path(), "Mine", "Add a contact form", TargetRef::None, Some(existing)).unwrap();
+    (d, ws)
+}
+
+#[test]
+fn a_persons_own_project_is_judged_by_its_own_build_and_tests_whatever_its_kind() {
+    use craft_anything_engine::workspace::ExistingFiles::Edit;
+    let (_d, ws) = own_folder("index.html", Edit);
+    let r = check_worker(&ws, false).run_checks(&ws, &GameKind, 1).unwrap();
+    assert_eq!(r.iter().map(|c| c.check.as_str()).collect::<Vec<_>>(), [CheckResult::BUILD, kinds::own::OwnTestsCheck::ID]);
+    assert!(r.iter().all(|c| c.passed), "{r:?}");
+    assert!(r[1].note.starts_with("No tests ran"), "says what wasn't run: {}", r[1].note);
+}
+
+#[test]
+fn a_persons_own_project_is_asked_for_nothing_it_would_add_for_our_sake() {
+    use craft_anything_engine::workspace::ExistingFiles::{Edit, StartFrom};
+    let (_d, mut own) = own_folder("main.py", Edit);
+    for k in ["app", "game"] {
+        let b = brief(&own, k, false, false, None, false, None);
+        assert!(!b.contains("--screenshot") && !b.contains("--self-test") && !b.contains("MECHANICS.md"), "{k}: {b}");
+        assert!(b.contains("its own build and tests") && !b.contains(kind(k).goal()), "{k}: {b}");
+    }
+    own.manifest.stack = "Unity".into();
+    let b = brief(&own, "game", false, false, Some(Path::new("/x/Unity")), false, None);
+    assert!(!b.contains("CraftBuild") && b.contains("keep to what the project already uses") && b.contains("/x/Unity"), "{b}");
+    own.manifest.generate_assets = true;
+    let b = brief(&own, "game", false, false, None, true, None);
+    assert!(b.contains("Assets/Generated/") && !b.contains("--screenshot"), "what the person turned on still reaches it: {b}");
+    let (_d, beside) = own_folder("main.py", StartFrom);
+    let b = brief(&beside, "app", false, false, None, false, None);
+    assert!(b.contains("--screenshot") && !b.contains("its own build and tests"), "a new app beside the files proves itself: {b}");
+}
+
+#[test]
+fn a_site_stack_with_nothing_to_recreate_is_a_website() {
+    let vite = "React + TypeScript (Vite)";
+    assert_eq!(kind_of("Add a contact form", &TargetRef::None, "Plain HTML and CSS"), "website");
+    assert_eq!(kind_of("A calculator in react", &TargetRef::None, vite), "website", "it can't be started as a program");
+    assert_eq!(kind_of("Add a high score to my game", &TargetRef::None, vite), "game", "the person's words come first");
+    assert_eq!(kind_of("Add a settings page", &TargetRef::None, "Python"), "app");
+    assert_eq!(kind_of("Add a settings page", &TargetRef::None, "Electron"), "app", "a window, not a site");
+    assert_eq!(kind_of("Copy this tool", &TargetRef::Local { path: "/x/tool".into() }, vite), "app", "an original decides");
 }
 
 #[test]
@@ -1819,8 +2817,9 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
-    let first = resumed_elsewhere("THE BRIEF", &ws.manifest.last_reply, None);
+    let first = under_way("THE BRIEF", Without::Elsewhere, &ws.manifest.last_reply, None, None);
     let reply = w.turn(&mut ws, &mut agent, "The person asks: make it blue", Some(first)).unwrap();
     assert_eq!(reply.trim(), "Carried on: yes");
     let sent = std::fs::read_to_string(bin.path().join("claude.last")).unwrap();
@@ -1873,8 +2872,9 @@ fn a_missing_session_with_nothing_to_start_from_is_said_plainly() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
-    let e = w.turn(&mut ws, &mut agent, "Carry on.", None).unwrap_err();
+    let e = w.turn_with_wait(&mut ws, &mut agent, "Carry on.", None, |_, _| panic!("a missing session without a fresh start must not be retried")).unwrap_err();
     assert!(e.message.contains("isn't on this computer"), "{e:?}");
     assert!(ws.manifest.agent_session.is_none());
 }
@@ -1936,6 +2936,7 @@ fn the_builders_conversation_travels_with_the_project() {
         decompiled: false,
         usage: None,
         self_check: None,
+        reset_progress_after_notes: false,
     };
     let adapter = KeepsSessions(store.path().to_path_buf());
     // No session yet, or one this computer doesn't have: nothing to keep, nothing said.
@@ -1958,11 +2959,11 @@ fn the_builders_conversation_travels_with_the_project() {
 
     // Where it can't be, the new session's first message carries the kept conversation.
     let handoff = crate::cli_agents::AgentAdapter::handoff(&adapter, &kept_session(&ws).unwrap(), HANDOFF_CHARS);
-    let first = resumed_elsewhere("THE BRIEF", "Last summary.", handoff.as_deref());
+    let first = under_way("THE BRIEF", Without::Elsewhere, "Last summary.", handoff.as_deref(), None);
     assert!(first.starts_with("THE BRIEF") && first.contains("isn't on this computer"), "{first}");
     assert!(first.contains("Craft Anything asked you: Make a notes app.") && first.contains("You answered: Built it with a sidebar."), "{first}");
     // Without a kept conversation, the last summary stands in for it.
-    let bare = resumed_elsewhere("THE BRIEF", "Last summary.", None);
+    let bare = under_way("THE BRIEF", Without::Elsewhere, "Last summary.", None, None);
     assert!(bare.contains("Last summary.") && !bare.contains("as the project kept it"), "{bare}");
 
     // A copy that can't be written is said, and the build goes on.
@@ -1971,4 +2972,249 @@ fn the_builders_conversation_travels_with_the_project() {
     w.keep_session(&ws, &adapter);
     let said: Vec<String> = rx.try_iter().filter_map(|e| if let RunEvent::Agent(AgentEvent::Status { text }) = e { Some(text) } else { None }).collect();
     assert!(said.iter().any(|t| t.contains("Couldn't keep a copy")), "{said:?}");
+}
+
+/// A coding agent that was signed in once and no longer is says so, rather than "isn't signed in",
+/// which reads as if the person never did.
+#[test]
+fn a_sign_in_that_stopped_working_is_called_that() {
+    assert_eq!(not_signed_in("claude-code", false), "Claude Code isn't signed in on this computer.");
+    assert_eq!(not_signed_in("claude-code", true), "Claude Code's sign-in on this computer has expired or was signed out.");
+}
+
+/// A follow-up to a builder that has the conversation that built the project is only what's new;
+/// one that starts without it (it never continues a session, as Codex didn't) gets the whole
+/// brief, what was made, and the person's request last, where it can't be missed.
+#[test]
+fn a_builder_without_its_conversation_gets_the_whole_brief_and_the_request_last() {
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Tanks", "A tank game prototype in Godot", TargetRef::None).unwrap();
+    ws.manifest.stack = "Godot".into();
+    ws.manifest.last_reply = "Built the prototype in Godot.".into();
+    ws.manifest.agent_session = Some("th-1".into());
+    let k = kind("game");
+    let cx = BriefCx { ws: &ws, deep: false, ghidra: false, editor: None, assets: false, image_model: None };
+    let ask = "Migrate it to NUI and C++";
+    let asked = follow_up(ask, "game");
+    let how = |has_history, api_loop| Opening { message: Some(ask), first: false, carrying_on: false, api_loop, has_history, handoff: None };
+    let (short, fresh) = opening(k.as_ref(), &cx, &how(true, false));
+    assert_eq!(short, asked, "only what's new");
+    let (full, _) = opening(k.as_ref(), &cx, &how(false, false));
+    assert!(full.starts_with(&brief(&ws, "game", false, false, None, false, None)), "{full}");
+    assert!(full.contains("you start this one without it") && full.contains("Built the prototype in Godot."), "{full}");
+    assert!(full.ends_with(&asked) && !full.contains("The person also said"), "{full}");
+    // A session that isn't on this computer: the same, said as such.
+    let fresh = fresh.unwrap();
+    assert!(fresh.contains("isn't on this computer") && fresh.ends_with(&asked) && fresh.contains("do what's asked at the end"), "{fresh}");
+    // Carrying on after a stop without the conversation: the carry-on comes last.
+    let stopped = Opening { message: None, first: false, carrying_on: true, api_loop: false, has_history: false, handoff: Some("You answered: Built it.") };
+    let (carry, _) = opening(k.as_ref(), &cx, &stopped);
+    assert!(carry.contains("You answered: Built it.") && carry.ends_with(&continue_prompt(k.as_ref())), "{carry}");
+}
+
+/// The person's request wins: it may change the stack, all of it is done, and a passing check
+/// isn't taken for a request done.
+#[test]
+fn a_follow_up_puts_the_persons_request_first() {
+    for k in KindRegistry::built_in().ids() {
+        let f = follow_up("Migrate it to NUI and C++", k);
+        assert!(f.starts_with("The person asks: \"Migrate it to NUI and C++\""), "{f}");
+        assert!(f.contains("do all of it") && f.contains("language, framework, engine or platform") && f.contains("only defaults"), "{f}");
+        assert!(f.contains("not that the request is done") && f.contains("core_person_ask") && f.contains("what's left"), "{f}");
+        assert!(f.contains("check it with rebuild_check"), "{f}");
+    }
+}
+
+/// Every combination, every kind: the run's first message changes only for a coding agent that
+/// starts without the earlier conversation while something is asked of the project under way.
+/// The other messages are the ones the run sent before (written out here as it chose them).
+#[test]
+fn the_first_message_changes_only_for_a_builder_without_its_conversation() {
+    // The message for a session that isn't on this computer, as it was written before (no handoff).
+    fn old_resumed_elsewhere(brief: &str, last_reply: &str) -> String {
+        let mut s = format!(
+            "{brief}\n\nThis project is already under way: an earlier conversation built it, but that conversation isn't on this computer (the project was started on another computer or in another folder). Everything made so far is in app/. Before changing anything, look through app/ and the open questions (core_unknowns_show) to see what's done, then carry on from there instead of starting again."
+        );
+        let last = last_reply.trim();
+        if !last.is_empty() {
+            let last: String = last.chars().take(2000).collect();
+            s.push_str(&format!("\n\nWhat the earlier conversation last told the person:\n\"{last}\""));
+        }
+        s
+    }
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    ws.manifest.last_reply = "Built it.".into();
+    let mut compared = 0;
+    for saved in [false, true] {
+        ws.manifest.agent_session = saved.then(|| "s-1".to_string());
+        for id in KindRegistry::built_in().ids() {
+            let k = kind(id);
+            let cx = BriefCx { ws: &ws, deep: true, ghidra: false, editor: None, assets: false, image_model: None };
+            let now = || k.follow_up_sections(&cx).iter().map(|s| format!("\n\n{s}")).collect::<String>() + &pictures_reminder(&ws);
+            for message in [None, Some("bigger title")] {
+                for bits in 0..16u8 {
+                    let (first, carrying_on, api_loop, has_history) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+                    let how = Opening { message, first, carrying_on, api_loop, has_history, handoff: None };
+                    let (prompt, fresh) = opening(k.as_ref(), &cx, &how);
+                    let before = match message {
+                        Some(m) if !first && has_history => super::follow_up(m, k.as_ref()) + &now(),
+                        None if carrying_on && !first && has_history => continue_prompt(k.as_ref()) + &now(),
+                        _ => {
+                            let b = super::brief(k.as_ref(), &cx, message);
+                            if api_loop { format!("{API_BUILDER}\n\n{b}") } else { b }
+                        }
+                    };
+                    let asked = !first && (message.is_some() || carrying_on);
+                    if !(asked && !has_history && !api_loop) {
+                        assert_eq!(prompt, before, "{id} {bits} {message:?}");
+                        compared += 1;
+                    }
+                    let fresh_before = (!api_loop && saved).then(|| old_resumed_elsewhere(&super::brief(k.as_ref(), &cx, message), "Built it."));
+                    if !asked {
+                        assert_eq!(fresh, fresh_before, "{id} {bits} {message:?}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(compared > 100, "{compared}");
+}
+
+/// A saved session is history only for a builder that continues it: an agent that starts every
+/// run afresh (or never saved one) gets the whole brief again.
+#[test]
+fn only_a_builder_that_continues_its_session_has_its_history() {
+    struct Forgets;
+    impl crate::cli_agents::AgentAdapter for Forgets {
+        fn ids(&self) -> &'static [&'static str] {
+            &["forgets"]
+        }
+        fn args(&self, _cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    ws.manifest.agent_session = Some("s-1".into());
+    let spec = |agent: &str| {
+        let config = crate::BackendConfig { name: "B".into(), kind: BackendKind::AgentCli, model: agent.into(), base_url: None, ssh_host: None, enabled: true };
+        let mut s = CliSpec::new(config, crate::config::BackendOptions::default(), false, None);
+        s.adapters.register(Arc::new(Forgets));
+        s
+    };
+    ws.manifest.agent_session_whole = Some(true);
+    assert!(has_history(None, &spec("claude-code"), &ws) && has_history(None, &spec("codex"), &ws));
+    assert!(!has_history(None, &spec("forgets"), &ws) && !has_history(None, &spec("gemini-cli"), &ws));
+    ws.manifest.agent_session_whole = Some(false);
+    assert!(!has_history(None, &spec("claude-code"), &ws) && !has_history(None, &spec("codex"), &ws), "it doesn't hold the brief");
+    ws.manifest.agent_session = None;
+    ws.manifest.agent_session_whole = Some(true);
+    assert!(!has_history(None, &spec("claude-code"), &ws), "nothing saved, nothing to continue");
+}
+
+/// A project Codex built before it resumed keeps the thread of its last run, which began with
+/// only the follow-up line. Its craft.json (version 2, with no mark on the session) is read as it
+/// was written, and that thread isn't taken for history: the next follow-up gets the whole brief.
+/// A Claude Code session from then always held the brief, and still counts.
+#[test]
+fn an_unmarked_codex_thread_from_before_it_resumed_isnt_history() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Tanks", "A tank game prototype in Godot", TargetRef::None).unwrap();
+    let path = ws.root.join("craft.json");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let old = doc.as_object_mut().unwrap();
+    old.insert("version".into(), json!(2));
+    old.insert("agent_session".into(), json!("019a-old-thread"));
+    old.insert("agent_session_by".into(), json!("codex"));
+    old.remove("agent_session_whole");
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut ws = Workspace::open(&ws.root).unwrap();
+    assert_eq!((ws.manifest.agent_session.as_deref(), ws.manifest.agent_session_whole), (Some("019a-old-thread"), None));
+    let spec = |agent: &str| {
+        let config = crate::BackendConfig { name: "B".into(), kind: BackendKind::AgentCli, model: agent.into(), base_url: None, ssh_host: None, enabled: true };
+        CliSpec::new(config, crate::config::BackendOptions::default(), false, None)
+    };
+    assert!(!has_history(None, &spec("codex"), &ws), "Codex's unmarked thread doesn't hold the brief");
+    assert!(has_history(None, &spec("claude-code"), &ws), "Claude Code's always did");
+    // Once a run marks the thread it saves, it counts, and the mark is kept in craft.json.
+    ws.manifest.agent_session_whole = Some(true);
+    ws.save().unwrap();
+    let ws = Workspace::open(&ws.root).unwrap();
+    assert_eq!(ws.manifest.agent_session_whole, Some(true));
+    assert!(has_history(None, &spec("codex"), &ws));
+}
+
+/// A follow-up's turn cut short is picked up ("carry on from where you stopped") only by a builder
+/// that continues its session; to one that starts every run afresh that line would be all it got,
+/// so it's sent the message again, whole, though it reported a saved session.
+#[test]
+fn only_a_builder_that_continues_its_session_is_told_to_carry_on() {
+    struct CutOff {
+        continues: bool,
+        sent: Arc<Mutex<Vec<String>>>,
+        queued: Vec<AgentEvent>,
+    }
+    impl Conversation for CutOff {
+        fn send(&mut self, text: &str) {
+            let mut sent = self.sent.lock().unwrap();
+            sent.push(text.to_string());
+            let done = AgentEvent::TurnDone { backend: "t".into(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false };
+            self.queued = if sent.len() == 1 {
+                vec![AgentEvent::Error { message: "The service is busy. Please retry in 0s".into(), remediation: None, log: None }, done]
+            } else {
+                vec![AgentEvent::TextDelta { text: "Finished.".into() }, done]
+            };
+        }
+        fn session_id(&self) -> Option<String> {
+            Some("s-1".into())
+        }
+        fn continues_session(&self) -> bool {
+            self.continues
+        }
+        fn last_failure(&self) -> Option<crate::TurnFailure> {
+            (self.sent.lock().unwrap().len() == 1).then_some(crate::TurnFailure { kind: crate::FailureKind::RateLimited, retry_after_secs: Some(0) })
+        }
+        fn poll(&mut self) -> Vec<AgentEvent> {
+            std::mem::take(&mut self.queued)
+        }
+        fn answer_consent(&mut self, _call_id: &str, _allow: bool) {}
+        fn stop(&mut self) {}
+        fn is_busy(&self) -> bool {
+            !self.queued.is_empty()
+        }
+    }
+    for continues in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = Worker {
+            wake: Default::default(),
+            engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
+            tx,
+            stop: CancelToken::default(),
+            preview: Arc::default(),
+            seen: HashSet::new(),
+            inbox: Inbox::new(ws.inbox_dir()),
+            editor: None,
+            notes: Arc::default(),
+            feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+            assets: false,
+            decompiled: false,
+            usage: None,
+            self_check: None,
+            reset_progress_after_notes: false,
+        };
+        let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut agent = CutOff { continues, sent: sent.clone(), queued: Vec::new() };
+        let result = w.turn_with_wait(&mut ws, &mut agent, "The person asks: make it blue", None, |_, _| Ok(()));
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(result.unwrap().trim(), "Finished.");
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        if continues {
+            assert!(sent[1].contains("Carry on from where you stopped"), "{sent:?}");
+        } else {
+            assert_eq!(sent[1], "The person asks: make it blue");
+        }
+    }
 }
